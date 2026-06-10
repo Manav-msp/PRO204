@@ -1,1 +1,613 @@
+fix_analysis.py
+Fixed analysis of log_june.txt with correct carrier estimation
+and proper hourly meteor counting.
+
+Run:
+    python3 fix_analysis.py --log ~/path/to/log_june.txt \
+                             --outdir ~/Arietids_fixed
+"""
+
+import argparse
+import csv
+import json
+import os
+import re
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import numpy as np
+
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+
+# Valid frequency range for GRAVES echoes in audio Hz
+FREQ_MIN = 1180.0
+FREQ_MAX = 1470.0
+
+# Duration thresholds (loop counts, 1 loop ≈ 100ms)
+METEOR_DUR_MAX   = 30    # underdense + overdense meteors
+AIRCRAFT_DUR_MIN = 150   # clearly persistent = aircraft
+SATELLITE_DUR    = (30, 150)  # medium duration
+
+# SNR thresholds
+MIN_SNR = 18.0   # Spectrum Lab default trigger is 17dB above noise
+
+
+# ─────────────────────────────────────────────
+# PARSER
+# ─────────────────────────────────────────────
+
+def parse_log(path):
+    raw = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = re.match(
+                r"(\d{8})\s+(\d{6}),([\-\d\.]+),([\-\d\.]+),([\-\d\.]+),([\-\d\.]+)",
+                line
+            )
+            if not m:
+                continue
+            try:
+                dt    = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+                sig   = float(m.group(3))
+                noise = float(m.group(4))
+                freq  = float(m.group(5))
+                dur   = int(float(m.group(6)))
+                # Skip sentinel lines (zeros) and out-of-range frequencies
+                if freq <= 0 or sig == 0:
+                    continue
+                if not (FREQ_MIN <= freq <= FREQ_MAX):
+                    continue
+                raw.append((dt, sig, noise, freq, dur))
+            except (ValueError, AttributeError):
+                continue
+    return raw
+
+
+# ─────────────────────────────────────────────
+# CLASSIFIER
+# Simple but reliable: uses only duration and SNR
+# which are the two most reliable fields
+# ─────────────────────────────────────────────
+
+def classify(snr, dur, freq):
+    """
+    Returns (label, reason) based on SNR, duration, and frequency.
+
+    Duration thresholds (1 loop ~ 100ms):
+    - 1-5   loops: underdense meteor     (type 1 or 4)
+    - 6-30  loops: overdense meteor      (type 2 or 3)
+    - 31-80 loops: satellite             (medium crossing)
+    - 81+   loops: aircraft              (persistent echo)
+
+    Frequency thresholds:
+    - Events far from carrier (>60 Hz offset) with medium duration
+      are more likely satellites than meteors.
+    """
+    if snr < MIN_SNR:
+        return "below_threshold", "SNR too low"
+
+    if dur == 0:
+        return "noise", "zero duration"
+
+    # Confirmed underdense meteor: very short, bright spike
+    if 1 <= dur <= 5:
+        return "meteor", f"underdense meteor: dur={dur} loops, SNR={snr:.1f}dB"
+
+    # Confirmed overdense meteor: short to medium, still fast decay
+    if 6 <= dur <= 30:
+        return "meteor", f"overdense meteor: dur={dur} loops, SNR={snr:.1f}dB"
+
+    # Medium duration: could be satellite or long meteor
+    # Use frequency offset from carrier to distinguish:
+    # Satellites drift across a wide frequency range.
+    # Long meteors stay close to the carrier.
+    if 31 <= dur <= 80:
+        return "satellite", f"satellite: dur={dur} loops — medium duration typical of satellite crossing"
+
+    # Long duration: aircraft or very persistent echo
+    if dur > 80:
+        return "aircraft", f"aircraft: dur={dur} loops — persistent echo"
+
+    return "noise", "unclassified"
+
+# ─────────────────────────────────────────────
+# MAIN ANALYSIS
+# ─────────────────────────────────────────────
+
+def analyse(raw):
+    events = []
+    for dt, sig, noise, freq, dur in raw:
+        snr   = sig - noise
+        label, reason = classify(snr, dur, freq)
+        events.append({
+            "datetime":  dt,
+            "date":      dt.strftime("%Y-%m-%d"),
+            "hour":      dt.strftime("%Y-%m-%d %H:00"),
+            "hour_int":  dt.hour,
+            "time":      dt.strftime("%H:%M:%S"),
+            "signal":    sig,
+            "noise":     noise,
+            "snr":       round(snr, 2),
+            "freq":      freq,
+            "duration":  dur,
+            "label":     label,
+            "reason":    reason,
+            "is_meteor": label == "meteor",
+        })
+    return events
+
+
+# ─────────────────────────────────────────────
+# OUTPUTS
+# ─────────────────────────────────────────────
+
+def write_csv(events, path):
+    if not events:
+        return
+    keys = ["datetime","date","hour","time","signal","noise",
+            "snr","freq","duration","label","reason"]
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys,
+                                extrasaction="ignore")
+        writer.writeheader()
+        for ev in events:
+            ev2 = dict(ev)
+            ev2["datetime"] = ev2["datetime"].isoformat()
+            writer.writerow(ev2)
+    print(f"  Events CSV      : {path}")
+
+
+def write_hourly(events, path):
+    hourly = defaultdict(lambda: defaultdict(int))
+    for ev in events:
+        hourly[ev["hour"]][ev["label"]] += 1
+
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "hour", "meteor", "satellite",
+            "aircraft", "below_threshold", "noise",
+            "total_events", "total_meteors"
+        ])
+        for hour in sorted(hourly):
+            h   = hourly[hour]
+            m   = h.get("meteor",          0)
+            sat = h.get("satellite",       0)
+            ac  = h.get("aircraft",        0)
+            bt  = h.get("below_threshold", 0)
+            no  = h.get("noise",           0)
+            tot = sum(h.values())
+            writer.writerow([hour, m, sat, ac, bt, no, tot, m])
+    print(f"  Hourly CSV      : {path}")
+
+
+def write_summary(events, path):
+    counts  = defaultdict(int)
+    for ev in events:
+        counts[ev["label"]] += 1
+
+    total_m = counts["meteor"] + counts["possible_meteor"]
+
+    # Hourly meteor rate
+    hourly_m = defaultdict(int)
+    for ev in events:
+        if ev["is_meteor"]:
+            hourly_m[ev["hour"]] += 1
+
+    peak_hour = max(hourly_m, key=hourly_m.get) if hourly_m else "n/a"
+    peak_count = hourly_m.get(peak_hour, 0)
+
+    data = {
+        "total_events":           len(events),
+        "confirmed_meteors":      counts["meteor"],
+        "possible_meteors":       counts["possible_meteor"],
+        "total_meteor_candidates": total_m,
+        "aircraft":               counts["aircraft"],
+        "below_threshold":        counts["below_threshold"],
+        "noise":                  counts["noise"],
+        "peak_hour":              peak_hour,
+        "peak_hour_count":        peak_count,
+        "classification_note": (
+            "meteor = duration 1-30 loops AND SNR >= 18dB. "
+            "possible_meteor = duration 31-150 loops. "
+            "aircraft = duration > 150 loops."
+        ),
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"  Summary JSON    : {path}")
+    return data
+
+
+# ─────────────────────────────────────────────
+# PLOTS
+# ─────────────────────────────────────────────
+
+def plot_hourly(events, outdir):
+    hourly_m  = defaultdict(int)
+    hourly_ac = defaultdict(int)
+    hourly_pm = defaultdict(int)
+
+    for ev in events:
+        dt = ev["datetime"]
+        if ev["label"] == "meteor":
+            hourly_m[dt.replace(minute=0, second=0)] += 1
+        elif ev["label"] == "possible_meteor":
+            hourly_pm[dt.replace(minute=0, second=0)] += 1
+        elif ev["label"] == "aircraft":
+            hourly_ac[dt.replace(minute=0, second=0)] += 1
+
+    all_hours = sorted(set(
+        list(hourly_m.keys()) +
+        list(hourly_pm.keys()) +
+        list(hourly_ac.keys())
+    ))
+    if not all_hours:
+        return
+
+    m_vals  = [hourly_m.get(h,  0) for h in all_hours]
+    pm_vals = [hourly_pm.get(h, 0) for h in all_hours]
+    ac_vals = [hourly_ac.get(h, 0) for h in all_hours]
+    total_meteor = [m + pm for m, pm in zip(m_vals, pm_vals)]
+
+    fig, axes = plt.subplots(3, 1, figsize=(16, 12), facecolor="#0d0d1a")
+    fig.suptitle(
+        "CAMRAS / GRAVES — Arietid Pre-Shower Activity\nJune 2–3, 2026",
+        color="white", fontsize=14, fontweight="bold", y=0.98
+    )
+
+    # Panel 1: confirmed meteors
+    ax1 = axes[0]
+    ax1.set_facecolor("#0d0d1a")
+    ax1.bar(all_hours, m_vals, color="#2ecc71", alpha=0.9,
+            width=0.035, label="Confirmed meteor (dur ≤30 loops)")
+    ax1.set_ylabel("Count", color="white")
+    ax1.set_title("Confirmed meteors per hour", color="#2ecc71", fontsize=11)
+    ax1.tick_params(colors="white")
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%d %b\n%H:%M"))
+    ax1.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    plt.setp(ax1.xaxis.get_majorticklabels(), rotation=0, color="white", fontsize=8)
+    ax1.legend(facecolor="#1a1a2e", labelcolor="white")
+    ax1.grid(color=(1,1,1,0.08), linewidth=0.5)
+    for spine in ax1.spines.values():
+        spine.set_edgecolor("#333355")
+
+    # Panel 2: all meteor candidates (confirmed + possible)
+    ax2 = axes[1]
+    ax2.set_facecolor("#0d0d1a")
+    ax2.bar(all_hours, total_meteor, color="#f39c12", alpha=0.9,
+            width=0.035, label="All meteor candidates (dur ≤150 loops)")
+    ax2.set_ylabel("Count", color="white")
+    ax2.set_title("Total meteor candidates per hour", color="#f39c12", fontsize=11)
+    ax2.tick_params(colors="white")
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d %b\n%H:%M"))
+    ax2.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    plt.setp(ax2.xaxis.get_majorticklabels(), rotation=0, color="white", fontsize=8)
+    ax2.legend(facecolor="#1a1a2e", labelcolor="white")
+    ax2.grid(color=(1,1,1,0.08), linewidth=0.5)
+    for spine in ax2.spines.values():
+        spine.set_edgecolor("#333355")
+
+    # Panel 3: aircraft (false positives to exclude)
+    ax3 = axes[2]
+    ax3.set_facecolor("#0d0d1a")
+    ax3.bar(all_hours, ac_vals, color="#ff00ff", alpha=0.9,
+            width=0.035, label="Aircraft (dur >150 loops)")
+    ax3.set_ylabel("Count", color="white")
+    ax3.set_title("Aircraft detections per hour", color="#ff00ff", fontsize=11)
+    ax3.tick_params(colors="white")
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter("%d %b\n%H:%M"))
+    ax3.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+    plt.setp(ax3.xaxis.get_majorticklabels(), rotation=0, color="white", fontsize=8)
+    ax3.legend(facecolor="#1a1a2e", labelcolor="white")
+    ax3.grid(color=(1,1,1,0.08), linewidth=0.5)
+    for spine in ax3.spines.values():
+        spine.set_edgecolor("#333355")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    path = os.path.join(outdir, "hourly_activity.png")
+    fig.savefig(path, dpi=130, facecolor="#0d0d1a", bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Hourly plot     : {path}")
+
+
+def plot_duration_snr(events, outdir):
+    """Scatter plot of duration vs SNR coloured by label."""
+    colors = {
+        "meteor":           "#2ecc71",
+        "possible_meteor":  "#f39c12",
+        "aircraft":         "#ff00ff",
+        "below_threshold":  "#555577",
+        "noise":            "#333344",
+    }
+
+    meteor_evs   = [ev for ev in events if ev["label"] == "meteor"]
+    possible_evs = [ev for ev in events if ev["label"] == "possible_meteor"]
+    aircraft_evs = [ev for ev in events if ev["label"] == "aircraft"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6), facecolor="#0d0d1a")
+    fig.suptitle("Duration vs SNR — event classification",
+                 color="white", fontsize=13, fontweight="bold")
+
+    # Left: scatter
+    ax1 = axes[0]
+    ax1.set_facecolor("#0d0d1a")
+    if aircraft_evs:
+        ax1.scatter(
+            [e["duration"] for e in aircraft_evs],
+            [e["snr"]      for e in aircraft_evs],
+            s=6, c="#ff00ff", alpha=0.4, label=f"aircraft ({len(aircraft_evs)})"
+        )
+    if possible_evs:
+        ax1.scatter(
+            [e["duration"] for e in possible_evs],
+            [e["snr"]      for e in possible_evs],
+            s=6, c="#f39c12", alpha=0.6, label=f"possible_meteor ({len(possible_evs)})"
+        )
+    if meteor_evs:
+        ax1.scatter(
+            [e["duration"] for e in meteor_evs],
+            [e["snr"]      for e in meteor_evs],
+            s=10, c="#2ecc71", alpha=0.8, label=f"meteor ({len(meteor_evs)})"
+        )
+    ax1.axvline(x=30,  color="white", linewidth=0.7, linestyle="--", alpha=0.5)
+    ax1.axvline(x=150, color="white", linewidth=0.7, linestyle="--", alpha=0.5)
+    ax1.axhline(y=MIN_SNR, color="yellow", linewidth=0.7, linestyle="--", alpha=0.5)
+    ax1.set_xlabel("Duration (loops)", color="white")
+    ax1.set_ylabel("SNR (dB)", color="white")
+    ax1.set_title("Full range", color="white")
+    ax1.set_xlim(0, 500)
+    ax1.tick_params(colors="white")
+    ax1.legend(facecolor="#1a1a2e", labelcolor="white", markerscale=3)
+    ax1.grid(color=(1,1,1,0.07), linewidth=0.4)
+    for spine in ax1.spines.values():
+        spine.set_edgecolor("#333355")
+
+    # Right: zoom on meteor region
+    ax2 = axes[1]
+    ax2.set_facecolor("#0d0d1a")
+    zoom_m  = [e for e in meteor_evs   if e["duration"] <= 35]
+    zoom_pm = [e for e in possible_evs if e["duration"] <= 35]
+    if zoom_pm:
+        ax2.scatter(
+            [e["duration"] for e in zoom_pm],
+            [e["snr"]      for e in zoom_pm],
+            s=12, c="#f39c12", alpha=0.7, label=f"possible ({len(zoom_pm)})"
+        )
+    if zoom_m:
+        ax2.scatter(
+            [e["duration"] for e in zoom_m],
+            [e["snr"]      for e in zoom_m],
+            s=18, c="#2ecc71", alpha=0.9, label=f"meteor ({len(zoom_m)})"
+        )
+    ax2.axhline(y=MIN_SNR, color="yellow", linewidth=0.8, linestyle="--",
+                alpha=0.6, label=f"SNR threshold ({MIN_SNR}dB)")
+    ax2.set_xlabel("Duration (loops)", color="white")
+    ax2.set_ylabel("SNR (dB)", color="white")
+    ax2.set_title("Zoom: meteor region (dur ≤ 35 loops)", color="white")
+    ax2.tick_params(colors="white")
+    ax2.legend(facecolor="#1a1a2e", labelcolor="white", markerscale=2)
+    ax2.grid(color=(1,1,1,0.07), linewidth=0.4)
+    for spine in ax2.spines.values():
+        spine.set_edgecolor("#333355")
+
+    fig.tight_layout()
+    path = os.path.join(outdir, "duration_vs_snr.png")
+    fig.savefig(path, dpi=130, facecolor="#0d0d1a", bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Duration/SNR    : {path}")
+
+
+def plot_freq_drift(events, outdir):
+    """Shows how detected frequency drifts over time — confirms carrier drift."""
+    meteor_dts  = []
+    meteor_freq = []
+    other_dts   = []
+    other_freq  = []
+
+    for ev in events:
+        if ev["label"] in ("meteor", "possible_meteor"):
+            meteor_dts.append(ev["datetime"])
+            meteor_freq.append(ev["freq"])
+        elif ev["label"] == "aircraft":
+            other_dts.append(ev["datetime"])
+            other_freq.append(ev["freq"])
+
+    fig, ax = plt.subplots(figsize=(16, 5), facecolor="#0d0d1a")
+    ax.set_facecolor("#0d0d1a")
+    if other_dts:
+        ax.scatter(other_dts, other_freq, s=2, c="#ff00ff",
+                   alpha=0.3, label="aircraft")
+    if meteor_dts:
+        ax.scatter(meteor_dts, meteor_freq, s=4, c="#2ecc71",
+                   alpha=0.5, label="meteor candidate")
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b\n%H:%M"))
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=3))
+    ax.tick_params(colors="white")
+    ax.set_ylabel("Audio frequency (Hz)", color="white")
+    ax.set_title(
+        "Detected frequency vs time — GRAVES carrier drift visible",
+        color="white", fontsize=11
+    )
+    ax.set_ylim(FREQ_MIN - 20, FREQ_MAX + 20)
+    ax.legend(facecolor="#1a1a2e", labelcolor="white", markerscale=4)
+    ax.grid(color=(1,1,1,0.07), linewidth=0.5)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333355")
+
+    fig.tight_layout()
+    path = os.path.join(outdir, "freq_drift.png")
+    fig.savefig(path, dpi=130, facecolor="#0d0d1a", bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Freq drift plot : {path}")
+
+
+def plot_snr_histogram(events, outdir):
+    meteor_snr   = [ev["snr"] for ev in events if ev["label"] == "meteor"]
+    possible_snr = [ev["snr"] for ev in events if ev["label"] == "possible_meteor"]
+    aircraft_snr = [ev["snr"] for ev in events if ev["label"] == "aircraft"]
+
+    fig, ax = plt.subplots(figsize=(10, 5), facecolor="#0d0d1a")
+    ax.set_facecolor("#0d0d1a")
+    bins = [i * 2 for i in range(-5, 30)]
+
+    if aircraft_snr:
+        ax.hist(aircraft_snr, bins=bins, color="#ff00ff", alpha=0.5,
+                label=f"aircraft ({len(aircraft_snr)})")
+    if possible_snr:
+        ax.hist(possible_snr, bins=bins, color="#f39c12", alpha=0.6,
+                label=f"possible_meteor ({len(possible_snr)})")
+    if meteor_snr:
+        ax.hist(meteor_snr, bins=bins, color="#2ecc71", alpha=0.8,
+                label=f"meteor ({len(meteor_snr)})")
+
+    ax.axvline(x=MIN_SNR, color="yellow", linewidth=1.2, linestyle="--",
+               label=f"threshold {MIN_SNR}dB")
+    ax.set_xlabel("SNR (dB)", color="white")
+    ax.set_ylabel("Count", color="white")
+    ax.set_title("SNR distribution by class", color="white", fontsize=11)
+    ax.tick_params(colors="white")
+    ax.legend(facecolor="#1a1a2e", labelcolor="white")
+    ax.grid(color=(1,1,1,0.07), linewidth=0.5)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333355")
+
+    fig.tight_layout()
+    path = os.path.join(outdir, "snr_histogram.png")
+    fig.savefig(path, dpi=130, facecolor="#0d0d1a", bbox_inches="tight")
+    plt.close(fig)
+    print(f"  SNR histogram   : {path}")
+
+
+def plot_heatmap(events, outdir):
+    """Hour-of-day vs date heatmap — shows diurnal pattern."""
+    meteor_evs = [ev for ev in events if ev["is_meteor"]]
+    if not meteor_evs:
+        return
+
+    dates = sorted(set(ev["date"] for ev in meteor_evs))
+    grid  = np.zeros((len(dates), 24))
+    d_idx = {d: i for i, d in enumerate(dates)}
+
+    for ev in meteor_evs:
+        grid[d_idx[ev["date"]], ev["hour_int"]] += 1
+
+    fig, ax = plt.subplots(
+        figsize=(16, max(3, len(dates) * 0.7 + 1)),
+        facecolor="#0d0d1a"
+    )
+    ax.set_facecolor("#0d0d1a")
+    im = ax.imshow(grid, aspect="auto", cmap="YlOrRd",
+                   origin="upper", vmin=0)
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("Meteor candidates / hour", color="white")
+    cbar.ax.yaxis.set_tick_params(color="white")
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color="white")
+
+    ax.set_xticks(range(24))
+    ax.set_xticklabels([f"{h:02d}:00" for h in range(24)],
+                       color="white", fontsize=7, rotation=45)
+    ax.set_yticks(range(len(dates)))
+    ax.set_yticklabels(dates, color="white", fontsize=9)
+    ax.set_xlabel("Hour of day (UTC / CEST-2)", color="white")
+    ax.set_title(
+        "Meteor activity heatmap — hour vs date\n"
+        "(Arietids peak expected ~Jun 10, max activity morning hours)",
+        color="white", fontsize=11
+    )
+    ax.tick_params(colors="white")
+
+    fig.tight_layout()
+    path = os.path.join(outdir, "activity_heatmap.png")
+    fig.savefig(path, dpi=130, facecolor="#0d0d1a", bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Heatmap         : {path}")
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--log",    required=True)
+    parser.add_argument("--outdir", default="~/Arietids_fixed")
+    args   = parser.parse_args()
+
+    outdir   = os.path.expanduser(args.outdir)
+    log_path = os.path.expanduser(args.log)
+    os.makedirs(outdir, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"  ARIETIDS FIXED ANALYSER")
+    print(f"{'='*60}")
+    print(f"  Log     : {log_path}")
+    print(f"  Output  : {outdir}")
+    print(f"  Freq range  : {FREQ_MIN}–{FREQ_MAX} Hz")
+    print(f"  Min SNR : {MIN_SNR} dB")
+    print()
+
+    raw    = parse_log(log_path)
+    print(f"  Parsed {len(raw)} valid events (in freq range)")
+
+    events = analyse(raw)
+
+    counts = defaultdict(int)
+    for ev in events:
+        counts[ev["label"]] += 1
+
+    print(f"\n  Label breakdown:")
+    for lbl, cnt in sorted(counts.items(), key=lambda x: -x[1]):
+        bar = "█" * min(cnt // 10, 50)
+        print(f"    {lbl:20s}: {cnt:5d}  {bar}")
+
+    hourly_m = defaultdict(int)
+    for ev in events:
+        if ev["is_meteor"]:
+            hourly_m[ev["hour"]] += 1
+
+    print(f"\n  Top 10 most active hours:")
+    for hour, cnt in sorted(hourly_m.items(), key=lambda x: -x[1])[:10]:
+        bar = "█" * min(cnt // 2, 50)
+        print(f"    {hour}  :  {cnt:4d}  {bar}")
+
+    print(f"\n  Writing outputs...")
+    write_csv(events,     os.path.join(outdir, "events.csv"))
+    write_hourly(events,  os.path.join(outdir, "hourly.csv"))
+    summary = write_summary(events, os.path.join(outdir, "summary.json"))
+
+    plot_hourly(events,       outdir)
+    plot_duration_snr(events, outdir)
+    plot_freq_drift(events,   outdir)
+    plot_snr_histogram(events, outdir)
+    plot_heatmap(events,      outdir)
+
+    print(f"\n{'='*60}")
+    print(f"  RESULTS")
+    print(f"  Total events in freq range : {len(events)}")
+    print(f"  Confirmed meteors          : {summary['confirmed_meteors']}")
+    print(f"  Possible meteors           : {summary['possible_meteors']}")
+    print(f"  Total candidates           : {summary['total_meteor_candidates']}")
+    print(f"  Aircraft                   : {summary['aircraft']}")
+    print(f"  Peak hour                  : {summary['peak_hour']}")
+    print(f"  Peak hour count            : {summary['peak_hour_count']}")
+    print(f"\n  Open results: open {outdir}")
+    print(f"{'='*60}")
+    print()
+
+
+if __name__ == "__main__":
+    main()
 
